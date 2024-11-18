@@ -4,6 +4,6 @@ import org.springframework.web.multipart.MultipartFile;
 
 public interface FHVTripRecordService {
 
-    String uploadParquetFile(MultipartFile file);
+    String uploadParquetFile(MultipartFile file, int rowIndex);
 
 }

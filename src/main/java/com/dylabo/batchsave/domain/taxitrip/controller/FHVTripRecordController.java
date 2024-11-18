@@ -17,7 +17,12 @@ public class FHVTripRecordController {
 
     @PostMapping("/upload-parquet")
     public String uploadParquetFile(@RequestParam("file") MultipartFile file) {
-        return fhvTripRecordService.uploadParquetFile(file);
+        return fhvTripRecordService.uploadParquetFile(file, 0);
+    }
+
+    @PostMapping("/upload-parquet/add")
+    public String uploadParquetFile(@RequestParam("rowIndex") int rowIndex, @RequestParam("file") MultipartFile file) {
+        return fhvTripRecordService.uploadParquetFile(file, rowIndex);
     }
 
 }

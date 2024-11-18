@@ -17,7 +17,6 @@ spring:
         jdbc.batch_size: 1000 # Hibernate 배치 크기
         order_inserts: true   # INSERT 정렬 최적화
         order_updates: true   # UPDATE 정렬 최적화
-        generate_statistics: true
 
   batch:
     jdbc:

@@ -1,5 +1,6 @@
 package com.dylabo.batchsave.domain.taxitrip.service.impl;
 
+import com.dylabo.batchsave.common.file.LocalInputFile;
 import com.dylabo.batchsave.domain.taxitrip.entity.FHVTripRecord;
 import com.dylabo.batchsave.domain.taxitrip.repository.FHVTripRecordRepository;
 import com.dylabo.batchsave.domain.taxitrip.service.FHVTripRecordService;
@@ -9,10 +10,18 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.example.data.Group;
 import org.apache.parquet.example.data.simple.SimpleGroup;
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
+import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
+import org.apache.parquet.hadoop.metadata.BlockMetaData;
+import org.apache.parquet.io.ColumnIOFactory;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.io.RecordReader;
+import org.apache.parquet.schema.MessageType;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -21,6 +30,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -35,8 +45,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Slf4j
 public class FHVTripRecordServiceImpl implements FHVTripRecordService {
 
-    private static final int THREAD_COUNT = 4; // 병렬 처리할 스레드 수
-    private static final int BATCH_SIZE = 10000; // 배치 크기
+    private static final int THREAD_COUNT = 6; // 병렬 처리할 스레드 수
+    private static final int BATCH_SIZE = 5000; // 배치 크기
 
     private final ExecutorService executorService = Executors.newFixedThreadPool(THREAD_COUNT, r -> {
         Thread thread = new Thread(r);
@@ -49,7 +59,7 @@ public class FHVTripRecordServiceImpl implements FHVTripRecordService {
     private final TransactionTemplate transactionTemplate;
 
     @Override
-    public String uploadParquetFile(MultipartFile file) {
+    public String uploadParquetFile(MultipartFile file, int rowIndex) {
         File tempFile = null;
         try {
             // 1. 업로드된 파일을 임시 디렉토리에 저장
@@ -62,7 +72,11 @@ public class FHVTripRecordServiceImpl implements FHVTripRecordService {
             log.info("임시 파일 생성됨: {}", tempFile.getAbsolutePath());
 
             // 2. 멀티스레드로 PARQUpip install pyarrowET 파일 처리
-            processParquetFile(tempFile);
+            if (rowIndex == 0) {
+                processParquetFile(tempFile);
+            } else {
+                processParquetFile(tempFile, rowIndex);
+            }
 
             return "Parquet 파일 처리가 완료되었습니다!";
         } catch (IOException ioe) {
@@ -92,6 +106,101 @@ public class FHVTripRecordServiceImpl implements FHVTripRecordService {
         Path parquetFilePath = new Path(filePath);
         AtomicInteger batchCounter = new AtomicInteger(0);
 
+        // 배치 시작 시간
+        LocalDateTime startTime = LocalDateTime.now();
+        log.info("배치 시작 : {}", startTime);
+
+        try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(file))) {
+            // 파일 메타데이터 가져오기
+            MessageType schema = reader.getFileMetaData().getSchema();
+            List<BlockMetaData> blocks = reader.getRowGroups();
+
+            log.info("총 블록 사이즈 : {}", blocks.size());
+
+            for (int blockIndex = 0; blockIndex < blocks.size(); blockIndex++) {
+                // RowGroup 가져오기
+                PageReadStore pageReadStore = reader.readNextRowGroup();
+
+                // 더이상 RowGroup 없으면 종료
+                if (pageReadStore == null) {
+                    break;
+                }
+
+                long rowCount = pageReadStore.getRowCount();
+
+                log.info("현재 블록 : {}", blockIndex);
+                log.info("현재 row 수 : {}", rowCount);
+
+                // reader 설정
+                MessageColumnIO columnIO = new ColumnIOFactory().getColumnIO(schema);
+                RecordReader<Group> recordReader = columnIO.getRecordReader(
+                        pageReadStore,
+                        new GroupRecordConverter(schema)
+                );
+
+                // 엔티티 초기화
+                List<FHVTripRecord> batch = new ArrayList<>(BATCH_SIZE);
+                Group record;
+
+                // 배치 시작
+                while ((record = recordReader.read()) != null) {
+                    batch.add(mapToEntity((SimpleGroup) record));
+
+                    if (batch.size() >= BATCH_SIZE) {
+                        // 배치 처리 작업을 병렬로 실행
+                        List<FHVTripRecord> batchToProcess = new ArrayList<>(batch);
+                        executorService.submit(() -> {
+                            transactionTemplate.execute(status -> {
+                                processBatch(batchToProcess, batchCounter.getAndIncrement());
+                                return null;
+                            });
+                        });
+                        batch.clear();
+                    }
+                }
+
+                // 남은 데이터 처리
+                if (!batch.isEmpty()) {
+                    executorService.submit(() -> {
+                        transactionTemplate.execute(status -> {
+                            processBatch(batch, batchCounter.getAndIncrement());
+                            return null;
+                        });
+                    });
+                }
+            }
+        } catch(Exception e) {
+            log.error("Parquet 파일 처리 중 오류 발생: " + e.getMessage());
+        } finally {
+            shutdownExecutor();
+
+            // 배치 종료 시간
+            LocalDateTime endTime = LocalDateTime.now();
+            log.info("배치 종료 : {}", endTime);
+
+            // 소요 시간 계산
+            long elapsedSeconds = Duration.between(startTime, endTime).getSeconds();
+            log.info("소요 시간 (초) : {} 초", elapsedSeconds);
+        }
+
+    }
+
+    @Transactional
+    public void processParquetFile(File file, int rowIndex) {
+        String filePath = file.getAbsolutePath();
+
+        Configuration conf = new Configuration();
+        conf.set("fs.defaultFS", "file:///");
+        conf.set("parquet.read.page.size", "1000");
+        conf.set("parquet.read.support.class", GroupReadSupport.class.getName());
+
+        Path parquetFilePath = new Path(filePath);
+        AtomicInteger batchCounter = new AtomicInteger(0);
+
+        // 배치 시작 시간
+        LocalDateTime startTime = LocalDateTime.now();
+        log.info("배치 시작 : {}", startTime);
+
         try (ParquetReader<Group> reader = ParquetReader.builder(new GroupReadSupport(), parquetFilePath)
                 .withConf(conf)
                 .build()
@@ -100,6 +209,8 @@ public class FHVTripRecordServiceImpl implements FHVTripRecordService {
             Group record;
 
             while ((record = reader.read()) != null) {
+                if (reader.getCurrentRowIndex() < rowIndex) continue;
+
                 batch.add(mapToEntity((SimpleGroup) record));
                 if (batch.size() >= BATCH_SIZE) {
                     // 배치 처리 작업을 병렬로 실행
@@ -128,6 +239,14 @@ public class FHVTripRecordServiceImpl implements FHVTripRecordService {
             log.error("Parquet 파일 처리 중 오류 발생: " + e.getMessage());
         } finally {
             shutdownExecutor();
+
+            // 배치 종료 시간
+            LocalDateTime endTime = LocalDateTime.now();
+            log.info("배치 종료 : {}", endTime);
+
+            // 소요 시간 계산
+            long elapsedSeconds = Duration.between(startTime, endTime).getSeconds();
+            log.info("소요 시간 (초) : {} 초", elapsedSeconds);
         }
 
     }
